@@ -16,6 +16,14 @@ jobs:
       - name: Check out the code
         uses: actions/checkout@v4
 
+      - name: Unpack the source zip
+        # The browser upload skipped every subfolder, so lib/ and site/
+        # live only inside this zip. Unpacking restores the real layout.
+        run: |
+          unzip -o tv-remote-repo.zip
+          echo "--- files now present ---"
+          ls -R lib site tool
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -27,6 +35,15 @@ jobs:
         with:
           channel: stable
           cache: true
+
+      - name: Guard against building the wrong app
+        # If lib/ is missing, flutter create silently generates a demo
+        # counter app and the build goes green with the wrong APK.
+        run: |
+          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
+          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
+          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
+          echo "Source looks right."
 
       - name: Generate the android/ project
         run: flutter create --platforms=android --org pk.bilal --project-name tv_remote .
