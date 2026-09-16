@@ -1,0 +1,91 @@
+name: Build APK and publish to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate the android/ project
+        run: flutter create --platforms=android --org pk.bilal --project-name tv_remote .
+
+      - name: Drop the placeholder test
+        run: rm -f test/widget_test.dart
+
+      - name: Patch the Android manifest
+        run: python3 tool/patch_android.py
+
+      - name: Fetch packages
+        run: flutter pub get
+
+      - name: Analyze
+        continue-on-error: true
+        run: flutter analyze
+
+      - name: Build release APKs
+        run: flutter build apk --release --split-per-abi
+
+      - name: Assemble the download site
+        run: |
+          set -e
+          mkdir -p site_out
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk   site_out/tv-remote.apk
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk site_out/tv-remote-32bit.apk
+          SIZE=$(du -h site_out/tv-remote.apk | cut -f1)
+          BUILT=$(date -u '+%d %b %Y, %H:%M UTC')
+          sed -e "s|__BUILD_DATE__|$BUILT|g" \
+              -e "s|__BUILD_NUMBER__|${{ github.run_number }}|g" \
+              -e "s|__COMMIT__|${GITHUB_SHA:0:7}|g" \
+              -e "s|__SIZE__|$SIZE|g" \
+              site/index.html > site_out/index.html
+          ls -lh site_out
+
+      - name: Fail if the APK is too big for Cloudflare Pages
+        run: |
+          BYTES=$(stat -c%s site_out/tv-remote.apk)
+          echo "APK is $BYTES bytes"
+          if [ "$BYTES" -gt 26214400 ]; then
+            echo "::error::APK exceeds the Cloudflare Pages 25 MB per-file limit."
+            exit 1
+          fi
+
+      - name: Upload the APKs to this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: tv-remote-apk
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+
+      - name: Publish to Cloudflare Pages
+        if: env.CF_TOKEN != ''
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site_out --project-name=tv-remote --branch=main
+
+      - name: Say where it went
+        if: env.CF_TOKEN == ''
+        run: echo "::notice::Cloudflare secrets not set. Download the APK from this run's Artifacts section instead."
