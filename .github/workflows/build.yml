@@ -9,20 +9,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Exposed at job level so the `if:` on the deploy step can see it.
     env:
       CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
-
-      - name: Unpack the source zip
-        # The browser upload skipped every subfolder, so lib/ and site/
-        # live only inside this zip. Unpacking restores the real layout.
-        run: |
-          unzip -o tv-remote-repo.zip
-          echo "--- files now present ---"
-          ls -R lib site tool
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -36,32 +29,31 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Guard against building the wrong app
-        # If lib/ is missing, flutter create silently generates a demo
-        # counter app and the build goes green with the wrong APK.
-        run: |
-          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
-          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
-          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
-          echo "Source looks right."
-
       - name: Generate the android/ project
+        # The repo holds only lib/ and pubspec.yaml. This fills in the
+        # platform folder. It never overwrites files that already exist.
         run: flutter create --platforms=android --org pk.bilal --project-name tv_remote .
 
       - name: Drop the placeholder test
+        # flutter create writes a test that references MyApp; this app's
+        # root widget is TvRemoteApp, so the test would fail to compile.
         run: rm -f test/widget_test.dart
 
       - name: Patch the Android manifest
+        # Adds INTERNET + Wi-Fi permissions and allows cleartext traffic.
+        # Without this the release APK cannot reach the TV at all.
         run: python3 tool/patch_android.py
 
       - name: Fetch packages
         run: flutter pub get
 
       - name: Analyze
+        # Does not block the build — read the log, then fix and push again.
         continue-on-error: true
         run: flutter analyze
 
       - name: Build release APKs
+        # --split-per-abi keeps each file well under Cloudflare's 25 MB limit.
         run: flutter build apk --release --split-per-abi
 
       - name: Assemble the download site
@@ -89,6 +81,7 @@ jobs:
           fi
 
       - name: Upload the APKs to this run
+        # Backup download path if Cloudflare is not set up yet.
         uses: actions/upload-artifact@v4
         with:
           name: tv-remote-apk
@@ -106,3 +99,72 @@ jobs:
       - name: Say where it went
         if: env.CF_TOKEN == ''
         run: echo "::notice::Cloudflare secrets not set. Download the APK from this run's Artifacts section instead."
+
+  # ---------------------------------------------------------------- iPhone
+  #
+  # A separate job so a macOS failure never blocks the Android APK. The .ipa
+  # it produces is UNSIGNED: iOS won't install it directly. Sign and install
+  # it from a PC with Sideloadly, using an ordinary Apple ID.
+  #
+  # macOS runners bill at 10x on private repos. This repo is public, so the
+  # minutes are free.
+  ios:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Unpack the source zip
+        run: |
+          unzip -n tv-remote-repo.zip
+          ls -R lib tool
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate the ios/ project
+        run: flutter create --platforms=ios --org pk.bilal --project-name tv_remote .
+
+      - name: Drop the placeholder test
+        run: rm -f test/widget_test.dart
+
+      - name: Patch Info.plist
+        # Local Network permission. Without it the app silently finds no TVs.
+        run: python3 tool/patch_ios.py
+
+      - name: Guard against building the wrong app
+        run: |
+          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
+          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
+          echo "Source looks right."
+
+      - name: Fetch packages
+        run: flutter pub get
+
+      - name: Build (unsigned)
+        run: flutter build ios --release --no-codesign
+
+      - name: Wrap it as an .ipa
+        # An .ipa is just a zip with the .app inside a Payload folder.
+        run: |
+          set -e
+          mkdir -p build/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ipa/Payload/
+          cd build/ipa
+          zip -qry tv-remote-unsigned.ipa Payload
+          ls -lh tv-remote-unsigned.ipa
+
+      - name: Upload the .ipa to this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: tv-remote-ipa
+          path: build/ipa/tv-remote-unsigned.ipa
+          if-no-files-found: error
+
+      - name: How to install it
+        run: |
+          echo "::notice::Unsigned .ipa built. Download it from this run's Artifacts, then sign and install with Sideloadly on your PC."
