@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ---------------------------------------------------------------- Android
   build:
     runs-on: ubuntu-latest
 
@@ -16,6 +17,15 @@ jobs:
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
+
+      - name: Unpack the source zip
+        # The repo holds only this workflow and the zip. Everything else —
+        # lib/, site/, tool/, pubspec.yaml — lives inside the zip.
+        # -n never overwrites, so a file added to the repo directly wins.
+        run: |
+          unzip -n tv-remote-repo.zip
+          echo "--- files now present ---"
+          ls -R lib site tool
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -29,9 +39,17 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Guard against building the wrong app
+        # Without lib/, flutter create silently generates a demo counter app
+        # and the build goes green with completely the wrong APK.
+        run: |
+          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
+          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
+          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
+          test -f tool/patch_android.py || { echo "::error::tool/patch_android.py missing"; exit 1; }
+          echo "Source looks right."
+
       - name: Generate the android/ project
-        # The repo holds only lib/ and pubspec.yaml. This fills in the
-        # platform folder. It never overwrites files that already exist.
         run: flutter create --platforms=android --org pk.bilal --project-name tv_remote .
 
       - name: Drop the placeholder test
@@ -81,7 +99,6 @@ jobs:
           fi
 
       - name: Upload the APKs to this run
-        # Backup download path if Cloudflare is not set up yet.
         uses: actions/upload-artifact@v4
         with:
           name: tv-remote-apk
@@ -118,6 +135,7 @@ jobs:
       - name: Unpack the source zip
         run: |
           unzip -n tv-remote-repo.zip
+          echo "--- files now present ---"
           ls -R lib tool
 
       - name: Set up Flutter
@@ -125,6 +143,13 @@ jobs:
         with:
           channel: stable
           cache: true
+
+      - name: Guard against building the wrong app
+        run: |
+          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
+          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
+          test -f tool/patch_ios.py || { echo "::error::tool/patch_ios.py missing"; exit 1; }
+          echo "Source looks right."
 
       - name: Generate the ios/ project
         run: flutter create --platforms=ios --org pk.bilal --project-name tv_remote .
@@ -135,12 +160,6 @@ jobs:
       - name: Patch Info.plist
         # Local Network permission. Without it the app silently finds no TVs.
         run: python3 tool/patch_ios.py
-
-      - name: Guard against building the wrong app
-        run: |
-          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
-          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
-          echo "Source looks right."
 
       - name: Fetch packages
         run: flutter pub get
