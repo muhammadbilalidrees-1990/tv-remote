@@ -65,6 +65,25 @@ jobs:
       - name: Fetch packages
         run: flutter pub get
 
+      - name: Dump the generated client certificate
+        # The TV rejects the app's TLS handshake with alert 47 while accepting
+        # a .NET-made certificate, so this prints what basic_utils actually
+        # produces. Never blocks the build.
+        continue-on-error: true
+        run: |
+          mkdir -p diag
+          dart run tool/dump_cert.dart 2>&1 | tee diag/client-cert.txt || true
+          echo "--- structure summary ---"
+          sed -n '/STRUCTURE/,/RSA NUMBERS/p' diag/client-cert.txt || true
+
+      - name: Upload the certificate dump
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-diagnostic
+          path: diag/
+          if-no-files-found: warn
+
       - name: Analyze
         # Does not block the build — read the log, then fix and push again.
         continue-on-error: true
