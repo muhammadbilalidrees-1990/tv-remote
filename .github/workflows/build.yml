@@ -89,9 +89,38 @@ jobs:
         continue-on-error: true
         run: flutter analyze
 
+      - name: Show the toolchain versions
+        # When a build that worked last week fails this week, it is almost
+        # always the toolchain moving under us. Printing this costs seconds
+        # and turns "exit code 1" into an answer.
+        continue-on-error: true
+        run: |
+          java -version 2>&1
+          flutter --version
+          echo "--- gradle wrapper ---"
+          cat android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null || true
+          echo "--- android gradle plugin ---"
+          grep -r "com.android.application\|agp_version\|com.android.tools.build" android/*.gradle* android/**/*.gradle* 2>/dev/null | head -5 || true
+
       - name: Build release APKs
         # --split-per-abi keeps each file well under Cloudflare's 25 MB limit.
-        run: flutter build apk --release --split-per-abi
+        #
+        # pipefail matters: without it, tee's exit code wins and a failed
+        # build reports success.
+        run: |
+          set -o pipefail
+          flutter build apk --release --split-per-abi 2>&1 | tee build-android.log
+
+      - name: Keep the build log whatever happened
+        # So a failure can be read without scrolling through the web UI:
+        # download "android-build-log" from this run's Artifacts.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: build-android.log
+          if-no-files-found: warn
 
       - name: Assemble the download site
         run: |
@@ -186,14 +215,58 @@ jobs:
       - name: Build (unsigned)
         run: flutter build ios --release --no-codesign
 
+      - name: Inspect what was built
+        # If the phone rejects the app as an "invalid file", the answer is
+        # almost always in here: wrong architecture, a minimum iOS version
+        # above the phone's, or a missing device family.
+        continue-on-error: true
+        run: |
+          APP=build/ios/iphoneos/Runner.app
+          echo "--- architectures ---"
+          lipo -info "$APP/Runner" || file "$APP/Runner"
+          echo "--- key Info.plist values ---"
+          for key in CFBundleIdentifier CFBundleExecutable MinimumOSVersion \
+                     UIDeviceFamily DTPlatformName CFBundleSupportedPlatforms; do
+            printf '%-28s ' "$key"
+            /usr/libexec/PlistBuddy -c "Print :$key" "$APP/Info.plist" 2>/dev/null || echo "(absent)"
+          done
+          echo "--- frameworks ---"
+          ls "$APP/Frameworks" 2>/dev/null || echo "(none)"
+
       - name: Wrap it as an .ipa
-        # An .ipa is just a zip with the .app inside a Payload folder.
+        # An .ipa is just a zip with the .app inside a Payload folder — but
+        # how that zip is made matters more than it looks.
+        #
+        # macOS attaches extended attributes to files, and `zip` faithfully
+        # stores them as AppleDouble "._" entries and a __MACOSX folder.
+        # Those survive into the archive, and an iPhone rejects the result
+        # as an invalid file. `xattr -cr` strips them at the source and
+        # `-X` stops zip writing any more.
+        #
+        # ditto is used instead of cp -R because it copies bundles exactly,
+        # symlinks and permissions included.
         run: |
           set -e
+          APP=build/ios/iphoneos/Runner.app
+
+          xattr -cr "$APP"
+          find "$APP" -name '.DS_Store' -delete
+
+          rm -rf build/ipa
           mkdir -p build/ipa/Payload
-          cp -R build/ios/iphoneos/Runner.app build/ipa/Payload/
+          ditto "$APP" build/ipa/Payload/Runner.app
+
           cd build/ipa
-          zip -qry tv-remote-unsigned.ipa Payload
+          zip -qr -X --symlinks tv-remote-unsigned.ipa Payload
+
+          echo "--- archive contents (first 25 entries) ---"
+          unzip -l tv-remote-unsigned.ipa | head -25
+          echo "--- checking for junk that breaks installation ---"
+          if unzip -l tv-remote-unsigned.ipa | grep -E '__MACOSX|/\._'; then
+            echo "::error::Resource-fork entries made it into the .ipa"
+            exit 1
+          fi
+          echo "Clean."
           ls -lh tv-remote-unsigned.ipa
 
       - name: Upload the .ipa to this run
