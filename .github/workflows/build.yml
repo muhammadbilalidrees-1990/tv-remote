@@ -279,3 +279,91 @@ jobs:
       - name: How to install it
         run: |
           echo "::notice::Unsigned .ipa built. Download it from this run's Artifacts, then sign and install with Sideloadly on your PC."
+
+  # ---------------------------------------------------------------- Mac
+  #
+  # A native macOS build. No signing certificates, no .ipa, no cable — Flutter
+  # targets the Mac directly and the result is an ordinary .app.
+  #
+  # It is ad-hoc signed, which is enough to run but not enough to satisfy
+  # Gatekeeper on a file downloaded from a browser. The notice at the end of
+  # this job says how to clear that.
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Unpack the source zip
+        run: |
+          unzip -n tv-remote-repo.zip
+          ls -R lib tool
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Guard against building the wrong app
+        run: |
+          test -f lib/main.dart || { echo "::error::lib/main.dart missing"; exit 1; }
+          grep -q "TvRemoteApp" lib/main.dart || { echo "::error::lib/main.dart is not the TV remote source"; exit 1; }
+          test -f tool/patch_macos.py || { echo "::error::tool/patch_macos.py missing"; exit 1; }
+          echo "Source looks right."
+
+      - name: Generate the macos/ project
+        run: flutter create --platforms=macos --org pk.bilal --project-name tv_remote .
+
+      - name: Drop the placeholder test
+        run: rm -f test/widget_test.dart
+
+      - name: Patch entitlements and Info.plist
+        # A Mac app is sandboxed with NO network access by default. Without
+        # this the app runs, finds nothing, and explains nothing.
+        run: python3 tool/patch_macos.py
+
+      - name: Fetch packages
+        run: flutter pub get
+
+      - name: Build the Mac app
+        run: |
+          set -o pipefail
+          flutter build macos --release 2>&1 | tee build-macos.log
+
+      - name: Keep the build log whatever happened
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build-log
+          path: build-macos.log
+          if-no-files-found: warn
+
+      - name: Sign it ad-hoc and package it
+        run: |
+          set -e
+          APP=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
+          echo "Built: $APP"
+
+          # An ad-hoc signature ("-") is not a developer certificate, but a
+          # Mac will run it once the quarantine flag is cleared.
+          codesign --force --deep --sign - "$APP"
+          codesign -dv "$APP" 2>&1 | head -5 || true
+
+          # ditto, not zip: it preserves the bundle's symlinks and the
+          # executable bit, which a plain zip quietly loses.
+          ditto -c -k --sequesterRsrc --keepParent "$APP" tv-remote-mac.zip
+          ls -lh tv-remote-mac.zip
+
+      - name: Upload the Mac app
+        uses: actions/upload-artifact@v4
+        with:
+          name: tv-remote-mac
+          path: tv-remote-mac.zip
+          if-no-files-found: error
+
+      - name: How to open it
+        run: |
+          echo "::notice::Download tv-remote-mac, unzip twice to get tv_remote.app, then in Terminal: xattr -dr com.apple.quarantine /path/to/tv_remote.app"
